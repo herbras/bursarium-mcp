@@ -20,6 +20,8 @@ import { TOOLS, findTool } from './tools.ts'
 
 interface Env {
   BURSARIUM_API_URL: string
+  // biome-ignore lint/suspicious/noExplicitAny: workers-ai binding type from cf runtime
+  AI: any
 }
 
 const app = new Hono<{ Bindings: Env }>()
@@ -271,9 +273,165 @@ app.post('/', async (c) => {
 })
 
 // Legacy SSE transport — accept GET for compat with older clients.
-// Not implementing fully (no streaming needed), just respond with 405.
 app.get('/sse', (c) =>
   c.text('SSE transport deprecated. Use Streamable HTTP at POST /', 405)
 )
+
+// ----------------------------------------------------------------------------
+// AI Q&A endpoint — accepts a natural-language question, runs Workers AI
+// (llama-3.3-70b) with our tool definitions, executes any tool calls against
+// api.sarbeh.com, returns the model's final answer + trace of tool calls.
+// ----------------------------------------------------------------------------
+
+const SYSTEM_PROMPT = `Kamu adalah asisten data Bursa Efek Indonesia (IDX) untuk Bursarium.
+
+Tugas: jawab pertanyaan tentang saham IDX, indeks, sektor, kepemilikan asing, dan fundamental, MENGGUNAKAN data dari tools yang tersedia. Jangan jawab dari pengetahuan umum saja.
+
+Aturan:
+1. Selalu panggil tool jika pertanyaan menyangkut data spesifik (harga, kepemilikan, ranking, dll).
+2. Jawab dalam Bahasa Indonesia, padat dan to-the-point.
+3. Sebutkan angka konkret dari data, bukan generalisasi.
+4. Selalu sebut sumber: "(sumber: KSEI, snapshot 31 Mar 2026)" atau "(sumber: IDX top-gainer, Feb 2026)".
+5. Jika data tidak cukup, katakan apa yang masih kurang.
+6. Format ticker dalam UPPERCASE (BBCA, TLKM).
+7. Refresh data: hourly market hours, daily 18:00 WIB, monthly KSEI.`
+
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant' | 'tool'
+  content: string
+  tool_calls?: { id: string; type: 'function'; function: { name: string; arguments: string } }[]
+  tool_call_id?: string
+  name?: string
+}
+
+async function runTool(env: Env, name: string, args: Record<string, unknown>): Promise<string> {
+  const tool = findTool(name)
+  if (!tool) return `Error: unknown tool ${name}`
+  const { url, postProcess } = tool.build(args)
+  try {
+    const res = await fetch(`${env.BURSARIUM_API_URL}${url}`, {
+      headers: {
+        Accept: postProcess ? 'application/json' : 'text/toon',
+        'User-Agent': 'bursarium-mcp-ai/0.1'
+      }
+    })
+    if (!res.ok) {
+      return `Error ${res.status}: ${(await res.text()).slice(0, 300)}`
+    }
+    const text = await res.text()
+    if (postProcess) {
+      try {
+        return JSON.stringify(postProcess(JSON.parse(text))).slice(0, 4000)
+      } catch {
+        return text.slice(0, 4000)
+      }
+    }
+    return text.slice(0, 4000)
+  } catch (err) {
+    return `Network error: ${err instanceof Error ? err.message : String(err)}`
+  }
+}
+
+app.post('/ask', async (c) => {
+  let body: { question?: string; history?: ChatMessage[] }
+  try {
+    body = await c.req.json()
+  } catch {
+    return c.json({ error: 'invalid JSON' }, 400)
+  }
+  if (!body.question || typeof body.question !== 'string') {
+    return c.json({ error: 'question (string) required' }, 400)
+  }
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    ...(body.history ?? []).slice(-8),
+    { role: 'user', content: body.question }
+  ]
+
+  const aiTools = TOOLS.map((t) => ({
+    type: 'function' as const,
+    function: {
+      name: t.name,
+      description: t.description,
+      parameters: t.inputSchema
+    }
+  }))
+
+  const traces: { tool: string; args: unknown; resultPreview: string }[] = []
+  const MAX_ITERS = 4
+
+  for (let i = 0; i < MAX_ITERS; i++) {
+    let aiResp: { response?: string; tool_calls?: ChatMessage['tool_calls'] }
+    try {
+      aiResp = await c.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+        messages,
+        tools: aiTools,
+        max_tokens: 1024
+      })
+    } catch (err) {
+      return c.json(
+        {
+          answer: `Maaf, model AI gagal merespons: ${err instanceof Error ? err.message : String(err)}`,
+          traces
+        },
+        500
+      )
+    }
+
+    // Workers AI Llama 3.3 returns tool_calls in two possible shapes:
+    //   A. OpenAI:  [{ id, type:'function', function:{ name, arguments } }]
+    //   B. Native:  [{ name, arguments }]
+    // Normalize to A.
+    // biome-ignore lint/suspicious/noExplicitAny: dual-shape narrowing
+    const rawCalls = (aiResp as any).tool_calls as any[] | undefined
+    if (rawCalls && rawCalls.length > 0) {
+      const normalized = rawCalls.map((c: any, i: number) => {
+        if (c.function) return c // already shape A
+        return {
+          id: c.id ?? `call_${i}`,
+          type: 'function' as const,
+          function: {
+            name: c.name as string,
+            arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {})
+          }
+        }
+      })
+      messages.push({ role: 'assistant', content: '', tool_calls: normalized })
+      for (const tc of normalized) {
+        let args: Record<string, unknown> = {}
+        try {
+          args = typeof tc.function.arguments === 'string'
+            ? JSON.parse(tc.function.arguments)
+            : (tc.function.arguments as Record<string, unknown>)
+        } catch {
+          args = {}
+        }
+        const result = await runTool(c.env, tc.function.name, args)
+        traces.push({ tool: tc.function.name, args, resultPreview: result.slice(0, 500) })
+        messages.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          name: tc.function.name,
+          content: result
+        })
+      }
+      continue
+    }
+
+    return c.json({
+      answer: aiResp.response ?? '(empty response)',
+      traces,
+      iterations: i + 1
+    })
+  }
+
+  return c.json({
+    answer:
+      'Maaf, saya tidak bisa selesaikan pertanyaan ini dalam batas iterasi. Coba pecah jadi pertanyaan yang lebih spesifik.',
+    traces,
+    iterations: MAX_ITERS
+  })
+})
 
 export default app

@@ -10,5 +10,6 @@
   ],
   "vars": {
     "BURSARIUM_API_URL": "https://api.sarbeh.com"
-  }
+  },
+  "ai": { "binding": "AI" }
 }
