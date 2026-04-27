@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bursarium-mcp",
+  "main": "src/worker.ts",
+  "compatibility_date": "2025-12-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "routes": [
+    { "pattern": "mcp.sarbeh.com", "custom_domain": true }
+  ],
+  "vars": {
+    "BURSARIUM_API_URL": "https://bursarium.sarbeh.com"
+  }
+}
