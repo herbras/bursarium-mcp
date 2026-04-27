@@ -9,6 +9,6 @@
     { "pattern": "mcp.sarbeh.com", "custom_domain": true }
   ],
   "vars": {
-    "BURSARIUM_API_URL": "https://bursarium.sarbeh.com"
+    "BURSARIUM_API_URL": "https://api.sarbeh.com"
   }
 }
