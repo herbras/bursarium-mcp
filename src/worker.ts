@@ -16,7 +16,7 @@
 //   GET  /health  Liveness
 
 import { Hono } from 'hono'
-import { TOOLS, findTool } from './tools.ts'
+import { TOOLS, coerceArgs, findTool } from './tools.ts'
 
 interface Env {
   BURSARIUM_API_URL: string
@@ -74,7 +74,7 @@ function err(id: JsonRpcRequest['id'], code: number, message: string): JsonRpcEr
 async function callTool(
   env: Env,
   toolName: string,
-  args: Record<string, unknown>
+  rawArgs: Record<string, unknown>
 ): Promise<{ content: Array<{ type: 'text'; text: string }>; isError?: boolean }> {
   const tool = findTool(toolName)
   if (!tool) {
@@ -84,6 +84,26 @@ async function callTool(
     }
   }
 
+  const args = coerceArgs(tool, rawArgs)
+
+  // Presentation tools — no API call, echo args.
+  if (tool.presentation) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify({ rendered: true, kind: toolName, args })
+        }
+      ]
+    }
+  }
+
+  if (!tool.build) {
+    return {
+      content: [{ type: 'text', text: `Tool ${toolName} has no build()` }],
+      isError: true
+    }
+  }
   const { url, postProcess } = tool.build(args)
   const fullUrl = `${env.BURSARIUM_API_URL}${url}`
 
@@ -283,18 +303,57 @@ app.get('/sse', (c) =>
 // api.sarbeh.com, returns the model's final answer + trace of tool calls.
 // ----------------------------------------------------------------------------
 
-const SYSTEM_PROMPT = `Kamu adalah asisten data Bursa Efek Indonesia (IDX) untuk Bursarium.
+function buildSystemPrompt(now: Date): string {
+  const y = now.getUTCFullYear()
+  const m = now.getUTCMonth() + 1
+  const monthNames = ['Januari','Februari','Maret','April','Mei','Juni','Juli','Agustus','September','Oktober','November','Desember']
+  const prevM = m === 1 ? 12 : m - 1
+  const prevY = m === 1 ? y - 1 : y
+  return `Kamu adalah asisten data Bursa Efek Indonesia (IDX) untuk Bursarium.
 
-Tugas: jawab pertanyaan tentang saham IDX, indeks, sektor, kepemilikan asing, dan fundamental, MENGGUNAKAN data dari tools yang tersedia. Jangan jawab dari pengetahuan umum saja.
+KONTEKS WAKTU (gunakan untuk resolusi pertanyaan relatif):
+- Hari ini: ${now.toISOString().slice(0,10)} (${monthNames[m-1]} ${y})
+- "bulan ini" = year=${y}, month=${m}
+- "bulan lalu" = year=${prevY}, month=${prevM}
+- "tahun ini" = ${y}
+JANGAN PERNAH menebak tanggal lain. Kalau pengguna tidak menyebut bulan/tahun, pakai yang di atas.
 
-Aturan:
-1. Selalu panggil tool jika pertanyaan menyangkut data spesifik (harga, kepemilikan, ranking, dll).
-2. Jawab dalam Bahasa Indonesia, padat dan to-the-point.
-3. Sebutkan angka konkret dari data, bukan generalisasi.
-4. Selalu sebut sumber: "(sumber: KSEI, snapshot 31 Mar 2026)" atau "(sumber: IDX top-gainer, Feb 2026)".
-5. Jika data tidak cukup, katakan apa yang masih kurang.
-6. Format ticker dalam UPPERCASE (BBCA, TLKM).
-7. Refresh data: hourly market hours, daily 18:00 WIB, monthly KSEI.`
+Tugas: jawab pertanyaan tentang saham IDX, indeks, sektor, kepemilikan asing, dan fundamental, MENGGUNAKAN data dari tools. Jangan jawab dari pengetahuan umum.
+
+Tools dibagi dua jenis:
+
+A. DATA tools — fetch dari Bursarium API. Panggil dulu untuk dapat angka.
+   search_emiten, get_ticker, get_ownership, get_ownership_history,
+   get_top_foreign_owned, get_foreign_flow, get_top_movers, get_indices,
+   get_index_summary, get_sectoral_movement, get_dividend_calendar,
+   get_financial_ratio, get_stock_screener, list_snapshots, list_endpoints.
+
+B. PRESENTATION tools — render visualisasi inline. Panggil SETELAH dapat data.
+   - present_stat       — angka headline (1 KPI)
+   - present_chart_line — time series (foreign% bulanan, IHSG harian)
+   - present_chart_bar  — ranking horizontal (top gainer, top foreign)
+   - present_split      — komposisi 100% (lokal vs asing)
+   - present_compare    — side-by-side dua entitas
+   - present_table      — tabel terstruktur
+
+Aturan KETAT:
+1. Selalu panggil DATA tool dulu untuk pertanyaan dengan angka spesifik.
+2. JANGAN panggil tool yang sama 2x dengan args sama — datanya sudah ada di context.
+3. Kalau hasil tool KOSONG (data: [] atau "data[0]:"), katakan TERANG-TERANGAN:
+   "Data untuk periode ini belum tersedia di vault Bursarium." JANGAN MENGARANG
+   nama sektor, ticker, atau angka. Lebih baik bilang tidak tahu.
+4. Setelah dapat data REAL (bukan kosong), pilih 1 presentation tool yang cocok:
+   - 1 angka penting → present_stat
+   - time series → present_chart_line
+   - ranking/list → present_chart_bar
+   - komposisi → present_split
+   - perbandingan 2 entitas → present_compare
+5. Maksimum 2 presentation tool per jawaban.
+6. Tutup dengan ringkasan teks 1-3 kalimat Bahasa Indonesia.
+7. Sebutkan sumber: "(sumber: KSEI ${monthNames[m-1]} ${y})" atau "(sumber: IDX, ${monthNames[m-1]} ${y})".
+8. Ticker UPPERCASE (BBCA, TLKM).
+9. Refresh: hourly market hours, daily 18:00 WIB, monthly KSEI.`
+}
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool'
@@ -304,9 +363,14 @@ interface ChatMessage {
   name?: string
 }
 
-async function runTool(env: Env, name: string, args: Record<string, unknown>): Promise<string> {
+async function runTool(env: Env, name: string, rawArgs: Record<string, unknown>): Promise<string> {
   const tool = findTool(name)
   if (!tool) return `Error: unknown tool ${name}`
+  const args = coerceArgs(tool, rawArgs)
+  if (tool.presentation) {
+    return JSON.stringify({ rendered: true, kind: name, args })
+  }
+  if (!tool.build) return `Error: tool ${name} has no build()`
   const { url, postProcess } = tool.build(args)
   try {
     const res = await fetch(`${env.BURSARIUM_API_URL}${url}`, {
@@ -344,30 +408,54 @@ app.post('/ask', async (c) => {
   }
 
   const messages: ChatMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'system', content: buildSystemPrompt(new Date()) },
     ...(body.history ?? []).slice(-8),
     { role: 'user', content: body.question }
   ]
 
-  const aiTools = TOOLS.map((t) => ({
-    type: 'function' as const,
-    function: {
-      name: t.name,
-      description: t.description,
-      parameters: t.inputSchema
-    }
-  }))
-
   const traces: { tool: string; args: unknown; resultPreview: string }[] = []
   const MAX_ITERS = 4
+  let presentationCallCount = 0
+  let dataCallCount = 0
+  const calledDataTools = new Set<string>()
+  // Fingerprint of every (toolName + args) pair we've already executed.
+  // Used to short-circuit identical repeat calls without burning quota.
+  const calledFingerprints = new Set<string>()
 
   for (let i = 0; i < MAX_ITERS; i++) {
+    // Tool availability schedule:
+    //   iter 0: data tools only — force the model to fetch first
+    //   iter 1..MAX-2: full toolbox unless quotas hit
+    //   iter MAX-1: no tools — force final text answer
+    let tools:
+      | { type: 'function'; function: { name: string; description: string; parameters: unknown } }[]
+      | undefined
+    if (i === MAX_ITERS - 1) {
+      tools = undefined // no tools → model must respond with text
+    } else {
+      tools = TOOLS.filter((t) => {
+        if (i === 0 && t.presentation) return false
+        if (presentationCallCount >= 2 && t.presentation) return false
+        // Avoid calling the same data tool twice with same args spamming.
+        if (!t.presentation && calledDataTools.has(t.name) && dataCallCount >= 2) return false
+        return true
+      }).map((t) => ({
+        type: 'function' as const,
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: t.inputSchema
+        }
+      }))
+    }
+
     let aiResp: { response?: string; tool_calls?: ChatMessage['tool_calls'] }
     try {
-      aiResp = await c.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
+      aiResp = await c.env.AI.run('@cf/meta/llama-4-scout-17b-16e-instruct', {
         messages,
-        tools: aiTools,
-        max_tokens: 1024
+        ...(tools ? { tools } : {}),
+        max_tokens: 1024,
+        temperature: 0.3
       })
     } catch (err) {
       return c.json(
@@ -407,8 +495,36 @@ app.post('/ask', async (c) => {
         } catch {
           args = {}
         }
-        const result = await runTool(c.env, tc.function.name, args)
-        traces.push({ tool: tc.function.name, args, resultPreview: result.slice(0, 500) })
+        // Llama sometimes serializes nested arrays/objects as JSON strings.
+        // Re-parse top-level string fields that look like JSON.
+        for (const k of Object.keys(args)) {
+          const v = args[k]
+          if (typeof v === 'string' && (v.startsWith('[') || v.startsWith('{'))) {
+            try {
+              args[k] = JSON.parse(v)
+            } catch {
+              /* leave as-is */
+            }
+          }
+        }
+        if (tc.function.name.startsWith('present_')) {
+          presentationCallCount++
+        } else {
+          dataCallCount++
+          calledDataTools.add(tc.function.name)
+        }
+        const tool = findTool(tc.function.name)
+        const coerced = tool ? coerceArgs(tool, args) : args
+        // Dedup identical calls — model often spam-calls the same tool twice.
+        const fp = `${tc.function.name}:${JSON.stringify(coerced)}`
+        let result: string
+        if (calledFingerprints.has(fp)) {
+          result = `Note: this exact call (${tc.function.name} with same args) already ran in this conversation. Re-using prior result. Synthesize an answer from the previous tool output instead of calling again.`
+        } else {
+          calledFingerprints.add(fp)
+          result = await runTool(c.env, tc.function.name, coerced)
+        }
+        traces.push({ tool: tc.function.name, args: coerced, resultPreview: result.slice(0, 500) })
         messages.push({
           role: 'tool',
           tool_call_id: tc.id,
